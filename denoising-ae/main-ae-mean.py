@@ -26,6 +26,7 @@ epochs = 50
 batch_size = 256
 name = './data2.csv'
 augment_data = True
+temporal_split = True
 
 probs =  np.arange(0.1, 1.0, 0.1)
 
@@ -43,7 +44,7 @@ input_dim = df.shape[1]
 output_dim = input_dim - 1
 
 #splitting dataset
-if True:
+if temporal_split:
     threshold = int(df.shape[0]*0.8)
     x_train = df.iloc[:threshold, :].copy()
     x_test = df.iloc[threshold:, :].copy()
@@ -116,6 +117,45 @@ def df_imputation(df, col_mean, idxs, inplace=False):
     df[idxs] = np.take(col_mean, idxs[1])
     return df    
 
+def knn_imputation(k, x_train, x_test):
+    from sklearn.neighbors import NearestNeighbors
+    knn = NearestNeighbors(n_neighbors=k)
+    
+    val_rmse = []
+    test_rmse = []    
+    
+    for p in probs:
+        _x_test, _x_test_corrupted, _x_test_mask = corrupt_data_interval(x_test, [p], False)
+        
+        for _row, _mask in zip(_x_test_corrupted, _x_test_mask):
+            matrix = x_train*_mask
+            knn.fit(matrix)
+            
+            x = _row.reshape((1, _row.shape[0]))
+            idxs = knn.kneighbors(x, return_distance=False)[0]
+            
+            mean_values = np.mean(x_train[idxs], axis=0)
+            
+            idxs = np.where(_mask == 0.0)[0]
+            _row[idxs] = np.take(mean_values, idxs)
+        _val = np.mean(get_rmse_mean_imputation(_x_test_corrupted, _x_test, mask=_mask))
+        _test = 0.0
+        
+        val_rmse.append(_val)
+        test_rmse.append(_test)
+        print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, np.mean(_val), np.mean(_test)))
+    return val_rmse, test_rmse
+
+k_values = [1,3,5,7,10]
+h = []
+for k in k_values:
+    print("K=%d"%(k))
+    a, _  = knn_imputation(k, x_train.values, x_val.values)
+    h.append(np.mean(a))
+
+best_k = k_values[np.argmin(h)]
+a, _  = knn_imputation(best_k, x_train.values, x_test.values)
+
 def mean_imputation(probs, x_val, x_test, mean_values):
     
     val_rmse = []
@@ -152,6 +192,8 @@ def mean_imputation(probs, x_val, x_test, mean_values):
     #     print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, np.mean(_rmse_val), np.mean(_rmse_test)))
 
 mean_val_rmse, mean_test_rmse = mean_imputation(probs, x_val.values, x_test.values, mean_values.values)
+
+#%%
 
 # standardizing data
 x_train = (x_train - mean_values)/std_values
