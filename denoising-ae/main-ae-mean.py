@@ -13,14 +13,15 @@ import pandas as pd
 import matplotlib.pyplot as plt 
 from sklearn.model_selection import train_test_split
 
-from keras import callbacks
-from keras import regularizers
-from keras.layers import Input, Dense
+from keras import backend as K
+from keras import objectives, callbacks, regularizers
+from keras.layers import Input, Dense, Lambda
 from keras.models import Model
 
 
 n_layers = 2
 encoding_dim = 32
+intermediate_dim = 4*encoding_dim
 l1_reg = 1e-8
 epochs = 50
 batch_size = 256
@@ -107,6 +108,7 @@ def get_rmse_mean_imputation(predicted, y, std=None, mask=None):
     rmse = np.sqrt(np.square(rmse).mean(axis=0))
     return rmse
 
+
 #### MEAN IMPUTATION
 def df_imputation(df, col_mean, idxs, inplace=False):
     if not inplace:
@@ -146,18 +148,21 @@ def knn_imputation(k, x_train, x_test):
         print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, np.mean(_val), np.mean(_test)))
     return val_rmse, test_rmse
 
-k_values = [1,3,5,7,10]
-h = []
-for k in k_values:
-    print("K=%d"%(k))
-    a, _  = knn_imputation(k, x_train.values, x_val.values)
-    h.append(np.mean(a))
 
-best_k = k_values[np.argmin(h)]
-a, _  = knn_imputation(best_k, x_train.values, x_test.values)
 
-def mean_imputation(probs, x_val, x_test, mean_values):
+def run_knn_imputation(x_train, x_val, x_test, k_values = [1,3,5,7,10]):
+    h = []
+    for k in k_values:
+        print("K=%d"%(k))
+        a, _  = knn_imputation(k, x_train.values, x_val.values)
+        h.append(np.mean(a))
     
+    best_k = k_values[np.argmin(h)]
+    print('Best K=%d'%(best_k))
+    a, _  = knn_imputation(best_k, x_train.values, x_test.values)
+    return k,a
+
+def run_mean_imputation(probs, x_val, x_test, mean_values):    
     val_rmse = []
     test_rmse = []
     
@@ -191,23 +196,10 @@ def mean_imputation(probs, x_val, x_test, mean_values):
     #     _rmse_test = get_rmse_mean_imputation(_x_test_corrupted, x_test, mask=x_test_mask)
     #     print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, np.mean(_rmse_val), np.mean(_rmse_test)))
 
-mean_val_rmse, mean_test_rmse = mean_imputation(probs, x_val.values, x_test.values, mean_values.values)
+
 
 #%%
 
-# standardizing data
-x_train = (x_train - mean_values)/std_values
-x_val = (x_val - mean_values)/std_values
-x_test = (x_test - mean_values)/std_values
-
-#converting from DataFrame to numpy array as Keras accepts numpy arrays
-x_train = x_train.values
-x_val = x_val.values
-x_test = x_test.values
-
-
-_x_train, _x_train_corrupted, _x_train_mask = corrupt_data_interval(x_train, probs, augment_data)
-_x_val, _x_val_corrupted, _x_val_mask = corrupt_data_interval(x_val, probs, augment_data)
 
 
 
@@ -228,80 +220,217 @@ if False:
     U, s, VT = svd(kk)
 
 
-#### SVD IMPUTATION
-
-#creating autoencoder
-layers = [(2**i)*encoding_dim for i in range(1,n_layers+1)]
-
-#encoder layers
-input_ts = Input(shape=(input_dim,), dtype='float32')
-if len(layers) > 0:
-    x = None
-    for i, dim in enumerate(reversed(layers)):
-        encoder = Dense(dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))
-        x = encoder(x) if i!=0 else encoder(input_ts)
+#### SVD IMPUTATION    
+def create_DAE():    
     
-    encoded = Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))(x)
+    #creating autoencoder
+    layers = [(2**i)*encoding_dim for i in range(1,n_layers+1)]
     
-    for i, dim in enumerate(layers):
-        decoder = Dense(dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))
-        x = decoder(x) if i!=0 else decoder(encoded)
+    #encoder layers
+    input_ts = Input(shape=(input_dim,), dtype='float32')
+    if len(layers) > 0:
+        x = None
+        for i, dim in enumerate(reversed(layers)):
+            encoder = Dense(dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))
+            x = encoder(x) if i!=0 else encoder(input_ts)
         
-    decoded = Dense(output_dim)(x) 
-else:
-    encoded = Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))(input_ts)
-    decoded = Dense(output_dim)(encoded)    
-
-autoencoder = Model(input_ts, decoded)
-autoencoder.compile(optimizer='adam', loss='mean_squared_error')
-
-#training autoencoder
-
-es = callbacks.EarlyStopping(monitor='val_loss', mode='min',  min_delta=0.01, patience=10, restore_best_weights=True, verbose=0)
-autoencoder_train = autoencoder.fit(_x_train_corrupted, _x_train[:,1:], validation_data=(_x_val_corrupted, _x_val[:,1:]), epochs=epochs, batch_size=batch_size, shuffle=True, verbose=1, callbacks=[es])
-
-loss = autoencoder_train.history['loss']
-val_loss = autoencoder_train.history['val_loss']
-x = range(len(loss))
-plt.figure()
-plt.plot(x, loss, 'bo', label='Training loss')
-plt.plot(x, val_loss, 'b', label='Validation loss')
-plt.title('Training and validation loss')
-plt.legend()
-plt.show()
-
-#testing the model
-
-
-
-x_val_predicted = autoencoder.predict(_x_val_corrupted)
-rmse_val = get_rmse_mean_imputation(x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=_x_val_mask[:,1:])
-rmse_val_full = get_rmse_mean_imputation(x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=None)
-print('RMSE-val: %.2f' %(np.mean(rmse_val)))
-print('RMSE-val Full: %.2f' %(np.mean(rmse_val_full)))
-
-
-ae_val_rmse = []
-ae_test_rmse = []
-
-for p in probs:
-    _x_val, _x_val_corrupted, _x_val_mask = corrupt_data_interval(x_val, [p], augment_data)
-    _x_test, _x_test_corrupted, _x_test_mask = corrupt_data_interval(x_test, [p], augment_data)
+        encoded = Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))(x)
+        
+        for i, dim in enumerate(layers):
+            decoder = Dense(dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))
+            x = decoder(x) if i!=0 else decoder(encoded)
+            
+        decoded = Dense(output_dim)(x) 
+    else:
+        encoded = Dense(encoding_dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))(input_ts)
+        decoded = Dense(output_dim)(encoded)    
     
-    _x_val_predicted = autoencoder.predict(_x_val_corrupted)
-    _x_test_predicted = autoencoder.predict(_x_test_corrupted)
+    autoencoder = Model(input_ts, decoded)
+    return autoencoder
+
+def run_DAE(x_train, x_val, x_test):
     
-    _rmse_val = get_rmse_mean_imputation(_x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=_x_val_mask[:,1:])    
-    _rmse_test = get_rmse_mean_imputation(_x_test_predicted, _x_test[:,1:], std_values.values[1:], mask=_x_test_mask[:,1:])    
+    x_train = x_train.copy()
+    x_val = x_val.copy()
+    x_test = x_test.copy()
     
-    _val = np.mean(_rmse_val)
-    _test = np.mean(_rmse_test) 
-    print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, _val, _test))
+    # standardizing data
+    x_train = (x_train - mean_values)/std_values
+    x_val = (x_val - mean_values)/std_values
+    x_test = (x_test - mean_values)/std_values
     
-    ae_val_rmse.append(_val)
-    ae_test_rmse.append(_test)
+    #converting from DataFrame to numpy array as Keras accepts numpy arrays
+    x_train = x_train.values
+    x_val = x_val.values
+    x_test = x_test.values
+    
+    
+    _x_train, _x_train_corrupted, _x_train_mask = corrupt_data_interval(x_train, probs, augment_data)
+    _x_val, _x_val_corrupted, _x_val_mask = corrupt_data_interval(x_val, probs, augment_data)
+
+    
+    
+    autoencoder = create_DAE()
+    autoencoder.compile(optimizer='adam', loss='mean_squared_error')
+    
+    #training autoencoder
+    
+    es = callbacks.EarlyStopping(monitor='val_loss', mode='min',  min_delta=0.01, patience=10, restore_best_weights=True, verbose=0)
+    autoencoder_train = autoencoder.fit(_x_train_corrupted, _x_train[:,1:], validation_data=(_x_val_corrupted, _x_val[:,1:]), epochs=epochs, batch_size=batch_size, shuffle=True, verbose=1, callbacks=[es])
+    
+    loss = autoencoder_train.history['loss']
+    val_loss = autoencoder_train.history['val_loss']
+    x = range(len(loss))
+    plt.figure()
+    plt.plot(x, loss, 'bo', label='Training loss')
+    plt.plot(x, val_loss, 'b', label='Validation loss')
+    plt.title('Training and validation loss')
+    plt.legend()
+    plt.show()
+    
+    #testing the model   
+    x_val_predicted = autoencoder.predict(_x_val_corrupted)
+    rmse_val = get_rmse_mean_imputation(x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=_x_val_mask[:,1:])
+    rmse_val_full = get_rmse_mean_imputation(x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=None)
+    print('RMSE-val: %.2f' %(np.mean(rmse_val)))
+    print('RMSE-val Full: %.2f' %(np.mean(rmse_val_full)))
+    
+    
+    ae_val_rmse = []
+    ae_test_rmse = []
+    
+    for p in probs:
+        _x_val, _x_val_corrupted, _x_val_mask = corrupt_data_interval(x_val, [p], augment_data)
+        _x_test, _x_test_corrupted, _x_test_mask = corrupt_data_interval(x_test, [p], augment_data)
+        
+        _x_val_predicted = autoencoder.predict(_x_val_corrupted)
+        _x_test_predicted = autoencoder.predict(_x_test_corrupted)
+        
+        _rmse_val = get_rmse_mean_imputation(_x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=_x_val_mask[:,1:])    
+        _rmse_test = get_rmse_mean_imputation(_x_test_predicted, _x_test[:,1:], std_values.values[1:], mask=_x_test_mask[:,1:])    
+        
+        _val = np.mean(_rmse_val)
+        _test = np.mean(_rmse_test) 
+        print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, _val, _test))
+        
+        ae_val_rmse.append(_val)
+        ae_test_rmse.append(_test)
+    
+    return ae_val_rmse, ae_test_rmse    
+    #rmse_test_full = get_rmse(x_test_predicted, x_test, std_values.values, mask=None)    
+    #print('RMSE-test Full: %.2f' %(np.mean(rmse_test_full)))
 
 
+    
+def create_VAE(input_dim, intermediate_dim, encoding_dim, epsilon_std=1e-4):
+    
+    def sampling(args):        
+        z_mean, z_log_sigma = args
+        batch = K.shape(z_mean)[0]
+        epsilon = K.random_normal(shape=(batch, encoding_dim),
+                                  mean=0.0, stddev=epsilon_std)
+        return z_mean + K.exp(z_log_sigma) * epsilon    
+
+    def vae_loss(x, x_decoded_mean):
+        #xent_loss = objectives.mean_squared_error(x, x_decoded_mean)
+        xent_loss = K.sum(K.square(x - x_decoded_mean), axis=-1)    
+        kl_loss = -0.5 * K.sum(1 + z_log_sigma - K.square(z_mean) - K.exp(z_log_sigma), axis=-1)
+        return xent_loss + kl_loss
+        
+    
+    # mapping input to latent distribution parameters
+    input_ts = Input(shape=(input_dim,), dtype='float32')
+    x = Dense(intermediate_dim, activation='relu', activity_regularizer=regularizers.l1(l1_reg))(input_ts)
+    z_mean = Dense(encoding_dim, activation='linear')(x)
+    z_log_sigma = Dense(encoding_dim, activation='linear')(x)
+    
+    z = Lambda(sampling, output_shape=(encoding_dim,))([z_mean, z_log_sigma])
+    
+    #mapping sampled latent points back to reconstructed inputs
+    h_decoded = Dense(intermediate_dim, activation='relu')(z)
+    input_decoded = Dense(output_dim)(h_decoded)
+    
+    vae = Model(input_ts, input_decoded)
+    vae.compile(optimizer='adam', loss=vae_loss)
+    return vae
+
+def run_VAE(x_train, x_val, x_test, input_dim, intermediate_dim, encoding_dim, epsilon_std=1e-4):
+    
+    x_train = x_train.copy()
+    x_val = x_val.copy()
+    x_test = x_test.copy()
+    
+    # standardizing data
+    x_train = (x_train - mean_values)/std_values
+    x_val = (x_val - mean_values)/std_values
+    x_test = (x_test - mean_values)/std_values
+    
+    #converting from DataFrame to numpy array as Keras accepts numpy arrays
+    x_train = x_train.values
+    x_val = x_val.values
+    x_test = x_test.values
+    
+    
+    _x_train, _x_train_corrupted, _x_train_mask = corrupt_data_interval(x_train, probs, augment_data)
+    _x_val, _x_val_corrupted, _x_val_mask = corrupt_data_interval(x_val, probs, augment_data)
+
+    
+    vae = create_VAE(input_dim, intermediate_dim, encoding_dim, epsilon_std)
+    
+    es = callbacks.EarlyStopping(monitor='val_loss', mode='min',  min_delta=0.01, patience=10, restore_best_weights=True, verbose=0)
+    vae_train = vae.fit(_x_train_corrupted, _x_train[:,1:], validation_data=(_x_val_corrupted, _x_val[:,1:]), epochs=epochs, batch_size=batch_size, shuffle=True, verbose=1, callbacks=[es])
+    
+    loss = vae_train.history['loss']
+    val_loss = vae_train.history['val_loss']
+    x = range(len(loss))
+    plt.figure()
+    plt.plot(x, loss, 'bo', label='Training loss')
+    plt.plot(x, val_loss, 'b', label='Validation loss')
+    plt.title('Training and validation loss')
+    plt.legend()
+    plt.show()
+    
+    
+    #testing the model   
+    x_val_predicted = vae.predict(_x_val_corrupted)
+    rmse_val = get_rmse_mean_imputation(x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=_x_val_mask[:,1:])
+    rmse_val_full = get_rmse_mean_imputation(x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=None)
+    print('RMSE-val: %.2f' %(np.mean(rmse_val)))
+    print('RMSE-val Full: %.2f' %(np.mean(rmse_val_full)))
+    
+    
+    vae_val_rmse = []
+    vae_test_rmse = []
+    
+    for p in probs:
+        _x_val, _x_val_corrupted, _x_val_mask = corrupt_data_interval(x_val, [p], augment_data)
+        _x_test, _x_test_corrupted, _x_test_mask = corrupt_data_interval(x_test, [p], augment_data)
+        
+        _x_val_predicted = vae.predict(_x_val_corrupted)
+        _x_test_predicted = vae.predict(_x_test_corrupted)
+        
+        _rmse_val = get_rmse_mean_imputation(_x_val_predicted, _x_val[:,1:], std_values.values[1:], mask=_x_val_mask[:,1:])    
+        _rmse_test = get_rmse_mean_imputation(_x_test_predicted, _x_test[:,1:], std_values.values[1:], mask=_x_test_mask[:,1:])    
+        
+        _val = np.mean(_rmse_val)
+        _test = np.mean(_rmse_test) 
+        print('RMSE (val, test) %.2f: %.4f \t %.4f' %(p, _val, _test))
+        
+        vae_val_rmse.append(_val)
+        vae_test_rmse.append(_test)
+    
+    return vae_val_rmse, vae_test_rmse    
+    
+    
+
+mean_val_rmse, mean_test_rmse = run_mean_imputation(probs, x_val.values, x_test.values, mean_values.values)
+ae_val_rmse, ae_test_rmse = run_DAE(x_train, x_val, x_test)
+
+vae_val_rmse, vae_test_rmse = run_VAE(x_train, x_val, x_test, input_dim, intermediate_dim, encoding_dim)
+
+
+
+### comparing AE with Mean imputation
 test_improv = 100*(np.array(ae_test_rmse) / np.array(mean_test_rmse))
 val_improv  = 100*(np.array(ae_val_rmse) / np.array(mean_val_rmse))
     
@@ -312,10 +441,7 @@ val_improv = np.round(val_improv, decimals=2)
 for p, v, t in zip(probs, val_improv, test_improv):
     print('Mean/AE (val, test) %.2f: %.2f \t %.2f' %(p, v, t))
 
-#rmse_test_full = get_rmse(x_test_predicted, x_test, std_values.values, mask=None)
-
-#print('RMSE-test Full: %.2f' %(np.mean(rmse_test_full)))
-
+run_knn_imputation(x_train, x_val, x_test)
 
 if False:
 #ploting rmse for each variable    
